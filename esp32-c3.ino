@@ -2,6 +2,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <freertos/stream_buffer.h>
 
 // NUS (Nordic UART Service) UUIDs
 #define NUS_SERVICE_UUID      "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -32,9 +33,9 @@ typedef struct struct_message {
 
 struct_message bypassSerialData;
 
-// FreeRTOS 큐
-QueueHandle_t msgRecv485Queue;
-QueueHandle_t msgSend485Queue;
+// FreeRTOS 스트림 버퍼 (바이트 스트림 bulk I/O)
+StreamBufferHandle_t msgRecv485Stream;
+StreamBufferHandle_t msgSend485Stream;
 
 // BLE Server 콜백: 연결/해제 이벤트 처리
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -53,7 +54,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     }
 };
 
-// BLE RX 콜백: 스마트폰에서 수신한 데이터를 RS-485 송신 큐에 넣음
+// BLE RX 콜백: 스마트폰에서 수신한 데이터를 RS-485 송신 스트림에 bulk 전송
 class MyRxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) {
         String rxValue = pCharacteristic->getValue();
@@ -61,10 +62,7 @@ class MyRxCallbacks : public BLECharacteristicCallbacks {
         if (rxValue.length() > 0) {
             DEBUG_PORT.print("recved-ble-data: ");
 
-            for (int i = 0; i < rxValue.length(); i++) {
-                uint8_t byte = rxValue[i];
-                xQueueSend(msgSend485Queue, &byte, 0);
-            }
+            xStreamBufferSend(msgSend485Stream, (const uint8_t*)rxValue.c_str(), rxValue.length(), 0);
 
             DEBUG_PORT.println("");
         }
@@ -120,7 +118,7 @@ void initBLE() {
 
 // RS-485에서 수신한 데이터를 BLE로 전송 (sendDataToWifi 대체)
 void sendDataToBLE() {
-    int itemCount = uxQueueMessagesWaiting(msgRecv485Queue);
+    size_t itemCount = xStreamBufferBytesAvailable(msgRecv485Stream);
 
     if (itemCount == 0) {
         return;
@@ -133,11 +131,11 @@ void sendDataToBLE() {
     }
 
     while (itemCount > 0) {
-        int sendSize = (itemCount > maxPacketSize) ? maxPacketSize : itemCount;
+        int sendSize = (itemCount > (size_t)maxPacketSize) ? maxPacketSize : itemCount;
 
-        for (int i = 0; i < sendSize; i++) {
-            xQueueReceive(msgRecv485Queue, &bleTxBuffer[i], 0);
-        }
+        // bulk read: 한 번의 호출로 sendSize 바이트 수신
+        sendSize = xStreamBufferReceive(msgRecv485Stream, bleTxBuffer, sendSize, 0);
+        if (sendSize == 0) break;
 
         pTxCharacteristic->setValue(bleTxBuffer, sendSize);
         pTxCharacteristic->notify();
@@ -148,7 +146,7 @@ void sendDataToBLE() {
         // notify 간 짧은 딜레이 (BLE 스택 처리 여유)
         delay(2);
 
-        itemCount = uxQueueMessagesWaiting(msgRecv485Queue);
+        itemCount = xStreamBufferBytesAvailable(msgRecv485Stream);
     }
 }
 
@@ -164,9 +162,8 @@ void bypssSerialTask(void* parameter)
         bypassSerialData.message[recvLen] = '\0';
 
         if( recvLen > 0 ) {
-            for ( int i = 0; i < recvLen; i++ ) {
-                xQueueSend( msgRecv485Queue, &bypassSerialData.message[i], 0 );
-            }
+            // bulk write: 한 번의 호출로 recvLen 바이트 전송
+            xStreamBufferSend( msgRecv485Stream, bypassSerialData.message, recvLen, 0 );
             DEBUG_PORT.print("\nrecv data from 485: ");
 
 
@@ -183,7 +180,7 @@ void bypssSerialTask(void* parameter)
         }
 
         do{
-            sendLen = uxQueueMessagesWaiting( msgSend485Queue );
+            sendLen = xStreamBufferBytesAvailable( msgSend485Stream );
             if( sendLen == 0 ) {
                 vTaskDelay( portTICK_PERIOD_MS);
                 break;
@@ -193,10 +190,8 @@ void bypssSerialTask(void* parameter)
                 sendLen = 200;
             }
 
-
-            for( int i = 0; i < sendLen; i++ ) {
-                xQueueReceive( msgSend485Queue, &bypassSerialData.message[i], 0 );
-            }
+            // bulk read: 한 번의 호출로 sendLen 바이트 수신
+            sendLen = xStreamBufferReceive( msgSend485Stream, bypassSerialData.message, sendLen, 0 );
 
             digitalWrite(RS485_TX_ENABLE_PIN, HIGH);
             vTaskDelay( portTICK_PERIOD_MS);
@@ -254,9 +249,9 @@ void setup() {
     // BLE 초기화
     initBLE();
 
-    // Queue 생성
-    msgRecv485Queue = xQueueCreate( DEBUG_MSG_BUFFER_SIZE, sizeof(char) );
-    msgSend485Queue = xQueueCreate( DEBUG_MSG_BUFFER_SIZE, sizeof(char) );
+    // StreamBuffer 생성 (trigger level 1: 1바이트 수신 시 즉시 unblock)
+    msgRecv485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE, 1 );
+    msgSend485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE, 1 );
 
     // 태스크 스택 크기 2048로 증가 (BLE 스택 사용량 고려)
     xTaskCreate(bypssSerialTask, "bypssSerialTask", 2048, NULL, 1, NULL);
