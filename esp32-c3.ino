@@ -19,6 +19,9 @@
 
 #define RS485_TX_ENABLE_PIN 5
 
+// 디버그 출력 제어 (프로덕션에서는 주석 처리)
+#define DEBUG_VERBOSE
+
 // BLE 전역 변수
 BLEServer* pServer = nullptr;
 BLECharacteristic* pTxCharacteristic = nullptr;
@@ -60,11 +63,11 @@ class MyRxCallbacks : public BLECharacteristicCallbacks {
         String rxValue = pCharacteristic->getValue();
 
         if (rxValue.length() > 0) {
-            DEBUG_PORT.print("recved-ble-data: ");
-
-            xStreamBufferSend(msgSend485Stream, (const uint8_t*)rxValue.c_str(), rxValue.length(), 0);
-
-            DEBUG_PORT.println("");
+             xStreamBufferSend(msgSend485Stream, (const uint8_t*)rxValue.c_str(), rxValue.length(), 0);
+#ifdef DEBUG_VERBOSE
+             DEBUG_PORT.print("recved-ble-data: ");
+             DEBUG_PORT.println(rxValue.length());
+#endif
         }
     }
 };
@@ -124,13 +127,16 @@ void sendDataToBLE() {
         return;
     }
 
-    // MTU 기반 최대 패킷 크기 (ATT overhead 3바이트 제외)
-    int maxPacketSize = BLE_MTU_SIZE - 3;
+    // 실제 협상된 MTU 기반 최대 패킷 크기 (ATT overhead 3바이트 제외)
+    uint16_t negotiatedMTU = pServer->getPeerMTU(pServer->getConnId()) - 3;
+    int maxPacketSize = (negotiatedMTU > 0 && negotiatedMTU < BLE_MTU_SIZE) ? negotiatedMTU : (BLE_MTU_SIZE - 3);
     if (maxPacketSize > (int)sizeof(bleTxBuffer)) {
         maxPacketSize = sizeof(bleTxBuffer);
     }
 
     while (itemCount > 0) {
+        if (!deviceConnected) return;  // 연결 해제 시 즉시 중단 (크래시 방지)
+
         int sendSize = (itemCount > (size_t)maxPacketSize) ? maxPacketSize : itemCount;
 
         // bulk read: 한 번의 호출로 sendSize 바이트 수신
@@ -140,11 +146,13 @@ void sendDataToBLE() {
         pTxCharacteristic->setValue(bleTxBuffer, sendSize);
         pTxCharacteristic->notify();
 
+#ifdef DEBUG_VERBOSE
         DEBUG_PORT.print("send 485-data to ble: ");
         DEBUG_PORT.println(sendSize);
+#endif
 
         // notify 간 짧은 딜레이 (BLE 스택 처리 여유)
-        delay(2);
+        vTaskDelay(1);
 
         itemCount = xStreamBufferBytesAvailable(msgRecv485Stream);
     }
@@ -158,14 +166,14 @@ void bypssSerialTask(void* parameter)
 
     while( true )
     {
-        recvLen = BYPASS_SRC_PORT.readBytes(bypassSerialData.message, DEBUG_MSG_BUFFER_SIZE);
+        recvLen = BYPASS_SRC_PORT.readBytes(bypassSerialData.message, DEBUG_MSG_BUFFER_SIZE - 1);
         bypassSerialData.message[recvLen] = '\0';
 
         if( recvLen > 0 ) {
             // bulk write: 한 번의 호출로 recvLen 바이트 전송
             xStreamBufferSend( msgRecv485Stream, bypassSerialData.message, recvLen, 0 );
+#ifdef DEBUG_VERBOSE
             DEBUG_PORT.print("\nrecv data from 485: ");
-
 
             if( bypassSerialData.message[1] == 0x10 || bypassSerialData.message[1] == 0x06 ) {
                 for(int i = 0; i < recvLen; i++) {
@@ -173,6 +181,7 @@ void bypssSerialTask(void* parameter)
                     DEBUG_PORT.print(" ");
                 }
             }
+#endif
         }
 
         else {
@@ -186,32 +195,33 @@ void bypssSerialTask(void* parameter)
                 break;
             }
 
-            if( sendLen > 200 ) {
-                sendLen = 200;
+            if( sendLen > 256 ) {
+                sendLen = 256;
             }
 
             // bulk read: 한 번의 호출로 sendLen 바이트 수신
             sendLen = xStreamBufferReceive( msgSend485Stream, bypassSerialData.message, sendLen, 0 );
 
-            digitalWrite(RS485_TX_ENABLE_PIN, HIGH);
-            vTaskDelay( portTICK_PERIOD_MS);
+             digitalWrite(RS485_TX_ENABLE_PIN, HIGH);
+             delayMicroseconds(10);  // RS-485 트랜시버 enable 시간 (~1-10μs)
 
-            BYPASS_SRC_PORT.write(bypassSerialData.message, sendLen);
-            BYPASS_SRC_PORT.flush(true);
+             BYPASS_SRC_PORT.write(bypassSerialData.message, sendLen);
+             BYPASS_SRC_PORT.flush(true);
+             delayMicroseconds(25);  // 마지막 바이트 stop bit 전송 완료 대기 (460800baud 기준 ~22μs)
 
-            digitalWrite(RS485_TX_ENABLE_PIN, LOW);
-            vTaskDelay( portTICK_PERIOD_MS);
+             digitalWrite(RS485_TX_ENABLE_PIN, LOW);
 
-            DEBUG_PORT.print("send data to 485:  ");
+#ifdef DEBUG_VERBOSE
+             DEBUG_PORT.print("send data to 485:  ");
 
-
-            if( bypassSerialData.message[1] == 0x10 || bypassSerialData.message[1] == 0x06 ) {
-                for( int i = 0; i < sendLen; i++ ) {
-                    DEBUG_PORT.print(bypassSerialData.message[i], HEX);
-                    DEBUG_PORT.print(" ");
-                }
-            }
-            DEBUG_PORT.println("");
+             if( bypassSerialData.message[1] == 0x10 || bypassSerialData.message[1] == 0x06 ) {
+                 for( int i = 0; i < sendLen; i++ ) {
+                     DEBUG_PORT.print(bypassSerialData.message[i], HEX);
+                     DEBUG_PORT.print(" ");
+                 }
+             }
+             DEBUG_PORT.println("");
+#endif
 
 
         }while(false);
@@ -250,11 +260,12 @@ void setup() {
     initBLE();
 
     // StreamBuffer 생성 (trigger level 1: 1바이트 수신 시 즉시 unblock)
-    msgRecv485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE, 1 );
-    msgSend485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE, 1 );
+    // BLE(~200KB/s) vs RS-485(~46KB/s) 속도 차이 고려하여 8192로 확대
+    msgRecv485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE * 2, 1 );
+    msgSend485Stream = xStreamBufferCreate( DEBUG_MSG_BUFFER_SIZE * 2, 1 );
 
-    // 태스크 스택 크기 2048로 증가 (BLE 스택 사용량 고려)
-    xTaskCreate(bypssSerialTask, "bypssSerialTask", 2048, NULL, 1, NULL);
+    // 태스크 스택 4096 (안전 마진 확보), 우선순위 2 (RS-485 타이밍 우선)
+    xTaskCreate(bypssSerialTask, "bypssSerialTask", 4096, NULL, 2, NULL);
 
 }
 
@@ -295,4 +306,6 @@ void loop() {
         // 미연결: LED 500ms 깜빡임 (advertising 중)
         led_on(500);
     }
+
+    vTaskDelay(1);  // 스케줄러에 CPU 양보 (싱글코어 필수)
 }
