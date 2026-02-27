@@ -2,7 +2,6 @@
     "sketch": "esp32-c3.ino",
     "configuration": "JTAGAdapter=builtin,CDCOnBoot=cdc,PartitionScheme=no_fs,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,UploadSpeed=921600,DebugLevel=none,EraseFlash=none,ZigbeeMode=default",
     "board": "esp32:esp32:esp32c3",
-    "port": "COM41",
     "programmer": "esptool",
     "output": "./build"
 }

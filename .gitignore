@@ -14,6 +14,11 @@ debug/
 .DS_Store
 Thumbs.db
 
+# arduino-cli 자동 생성 파일 (로컬 경로 포함, 재생성 가능)
+build.options.json
+compile_commands.json
+nul
+
 # 임시 파일
 *.log
 *.tmp

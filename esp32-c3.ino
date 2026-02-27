@@ -20,7 +20,7 @@
 #define RS485_TX_ENABLE_PIN 5
 
 // 디버그 출력 제어 (프로덕션에서는 주석 처리)
-#define DEBUG_VERBOSE
+// #define DEBUG_VERBOSE
 
 // BLE 전역 변수
 BLEServer* pServer = nullptr;
@@ -28,6 +28,17 @@ BLECharacteristic* pTxCharacteristic = nullptr;
 volatile bool deviceConnected = false;
 bool oldDeviceConnected = false;
 uint8_t bleTxBuffer[BLE_MTU_SIZE];
+
+// BLE 수신 watchdog: 마지막 패킷 수신 시각 (0=비활성)
+volatile unsigned long lastBleRxTime = 0;
+#define BLE_RX_TIMEOUT_MS 5000  // 5초 무응답 시 버퍼 클리어
+
+// 버퍼 리셋 플래그: BLE 콜백에서 직접 리셋 시 레이스 컨디션 방지
+// bypssSerialTask 루프 상단에서 안전하게 처리
+volatile bool pendingBufferReset = false;
+
+// MTU 캐시: 연결당 한 번만 쿼리 (0=미협상)
+uint16_t cachedMTU = 0;
 
 // RS-485 bypass 데이터 버퍼 (bypssSerialTask 전용)
 typedef struct struct_message {
@@ -53,6 +64,10 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
+        lastBleRxTime = 0;
+        cachedMTU = 0;
+        // bypssSerialTask 루프에서 안전하게 처리 (레이스 컨디션 방지)
+        pendingBufferReset = true;
         DEBUG_PORT.println("BLE Client Disconnected");
     }
 };
@@ -63,23 +78,18 @@ class MyRxCallbacks : public BLECharacteristicCallbacks {
         String rxValue = pCharacteristic->getValue();
 
         if (rxValue.length() > 0) {
-             xStreamBufferSend(msgSend485Stream, (const uint8_t*)rxValue.c_str(), rxValue.length(), 0);
+            lastBleRxTime = millis();  // watchdog 타이머 갱신
+            xStreamBufferSend(msgSend485Stream, (const uint8_t*)rxValue.c_str(), rxValue.length(), 0);
 #ifdef DEBUG_VERBOSE
-             DEBUG_PORT.print("recved-ble-data: ");
-             DEBUG_PORT.println(rxValue.length());
+            DEBUG_PORT.print("recved-ble-data: ");
+            DEBUG_PORT.println(rxValue.length());
 #endif
         }
     }
 };
 
-// BLE advertising 시작
+// BLE advertising 시작 (설정은 initBLE에서 1회만 - 재시작 시 UUID 중복 누적 방지)
 void startAdvertising() {
-    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    // 연결 파라미터 힌트 (iOS 호환성)
-    pAdvertising->setMinPreferred(0x06);  // 7.5ms
-    pAdvertising->setMaxPreferred(0x0C);  // 15ms
     BLEDevice::startAdvertising();
     DEBUG_PORT.println("BLE Advertising started");
 }
@@ -113,6 +123,13 @@ void initBLE() {
     // Service 시작
     pService->start();
 
+    // Advertising 설정 (1회만 - startAdvertising 재호출 시 UUID 중복 방지)
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);  // 7.5ms (iOS 호환성)
+    pAdvertising->setMaxPreferred(0x0C);  // 15ms
+
     // Advertising 시작
     startAdvertising();
 
@@ -127,12 +144,14 @@ void sendDataToBLE() {
         return;
     }
 
-    // 실제 협상된 MTU 기반 최대 패킷 크기 (ATT overhead 3바이트 제외)
-    uint16_t negotiatedMTU = pServer->getPeerMTU(pServer->getConnId()) - 3;
-    int maxPacketSize = (negotiatedMTU > 0 && negotiatedMTU < BLE_MTU_SIZE) ? negotiatedMTU : (BLE_MTU_SIZE - 3);
-    if (maxPacketSize > (int)sizeof(bleTxBuffer)) {
-        maxPacketSize = sizeof(bleTxBuffer);
+    // MTU 캐시: 연결당 한 번만 쿼리 (매 호출마다 BLE 스택 쿼리 오버헤드 제거)
+    if (cachedMTU == 0) {
+        uint16_t negotiatedMTU = pServer->getPeerMTU(pServer->getConnId());
+        if (negotiatedMTU <= 3) return;  // MTU 미협상, 다음 루프에서 재시도
+        negotiatedMTU -= 3;  // ATT overhead 3바이트 제외
+        cachedMTU = (negotiatedMTU < BLE_MTU_SIZE - 3) ? negotiatedMTU : (BLE_MTU_SIZE - 3);
     }
+    int maxPacketSize = cachedMTU;
 
     while (itemCount > 0) {
         if (!deviceConnected) return;  // 연결 해제 시 즉시 중단 (크래시 방지)
@@ -151,8 +170,8 @@ void sendDataToBLE() {
         DEBUG_PORT.println(sendSize);
 #endif
 
-        // notify 간 짧은 딜레이 (BLE 스택 처리 여유)
-        vTaskDelay(1);
+        // 단일코어: 1ms 고정 대기 대신 즉시 yield로 BLE 스택 태스크에 CPU 양보
+        taskYIELD();
 
         itemCount = xStreamBufferBytesAvailable(msgRecv485Stream);
     }
@@ -166,6 +185,14 @@ void bypssSerialTask(void* parameter)
 
     while( true )
     {
+        // BLE 연결 해제 시 버퍼 리셋 (onDisconnect 에서 직접 리셋 시 레이스 컨디션 방지)
+        if (pendingBufferReset) {
+            xStreamBufferReset(msgSend485Stream);
+            xStreamBufferReset(msgRecv485Stream);
+            pendingBufferReset = false;
+            DEBUG_PORT.println("BLE disconnected - buffers cleared");
+        }
+
         recvLen = BYPASS_SRC_PORT.readBytes(bypassSerialData.message, DEBUG_MSG_BUFFER_SIZE - 1);
         bypassSerialData.message[recvLen] = '\0';
 
@@ -191,7 +218,7 @@ void bypssSerialTask(void* parameter)
         do{
             sendLen = xStreamBufferBytesAvailable( msgSend485Stream );
             if( sendLen == 0 ) {
-                vTaskDelay( portTICK_PERIOD_MS);
+                vTaskDelay( pdMS_TO_TICKS(1) );
                 break;
             }
 
@@ -287,7 +314,7 @@ void led_on(int duration) {
 void loop() {
     // BLE 연결 해제 후 advertising 재시작
     if (!deviceConnected && oldDeviceConnected) {
-        delay(500);  // BLE 스택 정리 대기
+        vTaskDelay(pdMS_TO_TICKS(500));  // BLE 스택 정리 대기 (블로킹 delay → yield 방식으로 변경)
         startAdvertising();
         oldDeviceConnected = false;
         DEBUG_PORT.println("Restarting advertising...");
@@ -300,6 +327,12 @@ void loop() {
 
     // 연결 중: RS-485 수신 데이터를 BLE로 전송, LED 상시 ON
     if (deviceConnected) {
+        // watchdog: 마지막 수신 후 5초 경과 시 stale 데이터 클리어
+        if (lastBleRxTime > 0 && (millis() - lastBleRxTime > BLE_RX_TIMEOUT_MS)) {
+            xStreamBufferReset(msgSend485Stream);
+            lastBleRxTime = 0;
+            DEBUG_PORT.println("BLE RX timeout - send buffer cleared");
+        }
         sendDataToBLE();
         digitalWrite(LED_PIN, LOW);  // LED ON (active low)
     } else {
