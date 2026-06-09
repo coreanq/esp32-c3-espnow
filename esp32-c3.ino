@@ -97,6 +97,8 @@ void startAdvertising() {
 // BLE 초기화
 void initBLE() {
     BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setPower(ESP_PWR_LVL_P20, ESP_BLE_PWR_TYPE_DEFAULT);
+    BLEDevice::setPower(ESP_PWR_LVL_P20, ESP_BLE_PWR_TYPE_ADV);
     BLEDevice::setMTU(BLE_MTU_SIZE);
 
     // Server 생성
